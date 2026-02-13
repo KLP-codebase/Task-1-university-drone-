@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+Simple MAVLink mission:
+ - Arm (optionally force)
+ - Take off to 2 meters
+ - Hover for 5 seconds
+ - Move forward (body-frame velocity) for a few seconds
+ - Land and wait for disarm
+
+Usage:
+  ./venv/bin/python Task/mission_simple.py --force
+
+Options:
+  --alt 2.0           Takeoff altitude (meters)
+  --hover 5.0         Hover time (seconds)
+  --speed 1.0         Forward speed (m/s)
+  --forward 5.0       Forward time (seconds)
+  --force             Force arm if normal arm fails
+  --mav udp:0.0.0.0:14550   MAVLink endpoint
+"""
+import time
+import argparse
+import threading
+import socket
+import struct
+import numpy as np
+import cv2
+import math
+from datetime import datetime
+from pymavlink import mavutil
+
+
+def wait_heartbeat(m):
+    print('Waiting for heartbeat...')
+    m.wait_heartbeat()
+    print('Heartbeat received: system', m.target_system, 'component', m.target_component)
+
+
+def set_mode_guided(m):
+    # For ArduCopter: custom_mode = GUIDED (often 4)
+    # Use high-level set_mode to be robust
+    try:
+        m.set_mode_apm('GUIDED')
+        print('Requested GUIDED mode')
+    except Exception:
+        # fallback
+        m.mav.set_mode_send(m.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
+        print('Sent set_mode GUIDED fallback')
+    # give it a moment
+    time.sleep(1)
+
+
+def is_armed(m):
+    hb = m.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+    if not hb:
+        return False
+    base = getattr(hb, 'base_mode', 0)
+    return bool(base & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+
+def arm(m, force=False):
+    print(f'Arming (force={force})...')
+    if not force:
+        try:
+            m.arducopter_arm()
+
+            while True:
+                ack = m.recv_match(type='COMMAND_ACK', blocking=True)
+                if ack.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+                    print("ARM ACK:", ack)
+                    break
+            time.sleep(0.5)
+
+            while True:
+                msg = m.recv_match(type='STATUSTEXT', blocking=False)
+                if not msg:
+                    break
+                print("STATUS:", msg.text)
+
+        except Exception:
+            pass
+        # wait up to 5s
+        end = time.time() + 5
+        while time.time() < end:
+            if is_armed(m):
+                print('Armed')
+                return True
+            time.sleep(0.5)
+        print('Normal arming failed')
+    # force arm
+    print('Sending force-arm...')
+    m.mav.command_long_send(
+        m.target_system,
+        m.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        1,
+        21196,
+        0, 0, 0, 0, 0,
+    )
+    end = time.time() + 8
+    while time.time() < end:
+        if is_armed(m):
+            print('Armed (forced)')
+            return True
+        time.sleep(0.5)
+    print('Force arm failed')
+    return False
+
+
+def takeoff(m, alt):
+    print(f'Takeoff to {alt} m...')
+    m.mav.command_long_send(
+        m.target_system, m.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0,
+        0, 0, 0, 0,
+        0, 0,
+        float(alt)
+    )
+    # wait for altitude near target using GLOBAL_POSITION_INT
+    end = time.time() + 20
+    while time.time() < end:
+        msg = m.recv_match(type='GLOBAL_POSITION_INT', timeout=1)
+        if not msg:
+            continue
+        alt_m = msg.relative_alt / 1000.0  # millimeters, relative to home
+        print(f' Alt {alt_m:.2f} m')
+        if alt_m >= alt - 0.5:
+            print('Reached takeoff altitude')
+            return True
+    print('Takeoff confirmation timed out; continuing')
+    return False
+
+
+def hover(seconds):
+    print(f'Hovering for {seconds} s...')
+    time.sleep(seconds)
+
+
+def rotate_90_clockwise(m, duration_s=4.0):
+    print(f'Rotating 90 degrees clockwise over {duration_s} s')
+    # Use MAV_CMD_CONDITION_YAW to rotate 90 degrees
+    # param1: target angle in degrees (90 for quarter rotation)
+    # param2: angular speed in degrees per second
+    # param3: direction (1 = clockwise, -1 = counter-clockwise)
+    # param4: relative (1) or absolute (0)
+    
+    angular_speed = 90.0 / duration_s  # degrees per second
+    
+    m.mav.command_long_send(
+        m.target_system,
+        m.target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        0,
+        90.0,          # target angle (degrees)
+        angular_speed,  # speed (degrees/sec)
+        1.0,            # direction (1 = clockwise)
+        0.0,            # relative yaw angle (not used when absolute)
+        0, 0, 0
+    )
+    
+    # Wait for rotation to complete
+    time.sleep(duration_s)
+
+
+def forward_body_velocity(m, speed_mps, duration_s):
+    print(f'Move forward at {speed_mps} m/s for {duration_s} s (BODY_NED)')
+    frame = mavutil.mavlink.MAV_FRAME_BODY_NED
+    # type_mask: enable velocity only (ignore position, acceleration, yaw, yaw_rate)
+    # bits: ignore position (x,y,z)=1, ignore velocity=0 for vx,vy,vz, ignore accel=1, ignore yaw=1, ignore yaw_rate=1
+    type_mask = 0b0000111111000111
+    vx, vy, vz = float(speed_mps), 0.0, 0.0
+    end = time.time() + duration_s
+    while time.time() < end:
+        m.mav.set_position_target_local_ned_send(
+            0,
+            m.target_system,
+            m.target_component,
+            frame,
+            type_mask,
+            0, 0, 0,
+            vx, vy, vz,
+            0, 0, 0,
+            0, 0
+        )
+        time.sleep(0.1)
+
+
+def land(m):
+    print('Landing...')
+    try:
+        m.set_mode_apm('LAND')
+    except Exception:
+        m.mav.set_mode_send(m.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)  # LAND
+    # also send NAV_LAND as a hint
+    m.mav.command_long_send(
+        m.target_system, m.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,
+        0,0,0,0,
+        0,0,0
+    )
+    # wait for disarm
+    end = time.time() + 20
+    while time.time() < end:
+        if not is_armed(m):
+            print('Disarmed; landed')
+            return True
+        time.sleep(0.5)
+    print('Land/disarm wait timed out')
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--alt', type=float, default=2)
+    ap.add_argument('--hover', type=float, default=13.0)
+    ap.add_argument('--speed', type=float, default=0.3)
+    ap.add_argument('--forward', type=float, default=20.0)
+    ap.add_argument('--force', action='store_true')
+    ap.add_argument('--mav', type=str, default='udp:0.0.0.0:14550')
+    ap.add_argument('--camera', action='store_true', help='Show camera frames with cv2.imshow')
+    ap.add_argument('--camera-host', type=str, default='127.0.0.1')
+    ap.add_argument('--camera-port', type=int, default=5599)
+    ap.add_argument('--video-output', type=str, default=None, help='Path to save camera video (e.g., output.mp4)')
+    args = ap.parse_args()
+
+    m = mavutil.mavlink_connection(args.mav)
+    wait_heartbeat(m)
+
+    # Start camera thread if requested
+    stop_event = None
+    cam_thread = None
+    if args.camera:
+        stop_event = threading.Event()
+        cam_thread = threading.Thread(target=_camera_loop, args=(args.camera_host, args.camera_port, stop_event, args.video_output), daemon=True)
+        cam_thread.start()
+
+    set_mode_guided(m)
+    if not arm(m, force=args.force):
+        if stop_event:
+            stop_event.set()
+            try:
+                cam_thread.join(timeout=2)
+            except Exception:
+                pass
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+        raise SystemExit('Failed to arm')
+    takeoff(m, args.alt)
+    hover(args.hover)
+    forward_body_velocity(m, args.speed, args.forward)
+    hover(args.hover)
+    rotate_90_clockwise(m)
+    hover(5.0)
+    forward_body_velocity(m, args.speed, args.forward)
+    hover(18.5)
+    land(m)
+
+    # Stop camera thread
+    if stop_event:
+        stop_event.set()
+        try:
+            cam_thread.join(timeout=2)
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+
+ # ---------------- Camera helpers -----------------
+
+def _recvn(sock, n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _camera_loop(host, port, stop_event, video_output=None):
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+    except Exception as e:
+        print(f'Camera: failed to connect to {host}:{port}: {e}')
+        return
+    print(f'Camera: connected to {host}:{port}')
+    
+    # Initialize video writer if output path is specified
+    video_writer = None
+    frame_width = None
+    frame_height = None
+    
+    if video_output:
+        print(f'Camera: will save video to {video_output}')
+    
+    try:
+        while not stop_event.is_set():
+            hdr = _recvn(sock, 4)
+            if not hdr:
+                break
+            try:
+                w, h = struct.unpack('<HH', hdr)
+            except Exception:
+                break
+            size = int(w) * int(h)
+            buf = _recvn(sock, size)
+            if not buf:
+                break
+            try:
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape((h, w))
+            except Exception:
+                continue
+            
+            # Initialize video writer on first frame
+            if video_output and video_writer is None:
+                frame_height, frame_width = frame.shape
+                # Use MP4V codec with .mp4 extension
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video_writer = cv2.VideoWriter(video_output, fourcc, 30.0, (frame_width, frame_height), isColor=False)
+                if not video_writer.isOpened():
+                    print(f'Camera: Failed to open video writer for {video_output}')
+                else:
+                    print(f'Camera: Video writer initialized - {frame_width}x{frame_height} @ 30 fps')
+            
+            # Write frame to video file
+            if video_writer is not None and video_writer.isOpened():
+                video_writer.write(frame)
+            
+            cv2.imshow('Camera', frame)
+            # allow UI to update and quit on 'q'
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                stop_event.set()
+                break
+    except Exception as e:
+        print(f'Camera loop error: {e}')
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        
+        # Release video writer
+        if video_writer is not None:
+            video_writer.release()
+            print(f'Camera: Video saved to {video_output}')
+
+if __name__ == '__main__':
+    main()

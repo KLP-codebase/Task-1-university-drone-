@@ -28,6 +28,21 @@ import cv2
 import math
 from datetime import datetime
 from pymavlink import mavutil
+from pupil_apriltags import Detector
+
+def detect_apriltags(frame):
+    detector = Detector(
+        families='tag36h11',
+        nthreads=4,
+        quad_decimate=1.0,
+        quad_sigma=0.0,
+        refine_edges=1,
+        decode_sharpening=0.25,
+        debug=0
+    )
+    results = detector.detect(frame)
+    for r in results:
+        print(f"Detected tag ID {r.tag_id} at center {r.center} with corners {r.corners}")
 
 
 def wait_heartbeat(m):
